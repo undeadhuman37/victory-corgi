@@ -959,6 +959,66 @@ mod tests {
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
+    /// A pixel shader's helper lanes: a quad permute reads through quad reads,
+    /// and `v_readfirstlane_b32` asks whether the lane is a helper.
+    #[test]
+    fn a_pixel_shaders_cross_lane_reads_reach_helper_lanes() {
+        let words = [
+            0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+            0x7E02_02FA,
+            0xFF00_B100, // v_mov_b32 v1, v0 quad_perm:[1,0,3,2]
+            0x7E00_0501, // v_readfirstlane_b32 s0, v1
+            0x7E04_0200, // v_mov_b32 v2, s0
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = constant_color();
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        // The bitcode holds a name as 6-bit chunks, two a character, at any bit.
+        let bits: Vec<u8> = out
+            .dxil
+            .iter()
+            .flat_map(|b| (0..8).map(move |i| b >> i & 1))
+            .collect();
+        let has = |name: &str| {
+            let want: Vec<u8> = name
+                .bytes()
+                .flat_map(|b| [b & 31 | 32, b >> 5])
+                .flat_map(|chunk| (0..6).map(move |i| chunk >> i & 1))
+                .collect();
+            bits.windows(want.len()).any(|w| w == want)
+        };
+        assert!(has("quadReadLaneAt"), "the quad permute");
+        assert!(!has("waveReadLaneAt"), "the quad permute");
+        assert!(has("isHelperLane"), "the first-lane read");
+    }
+
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
     /// output signature has SV_StencilRef, and the feature bit
